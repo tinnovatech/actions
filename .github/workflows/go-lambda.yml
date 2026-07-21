@@ -1,0 +1,85 @@
+name: go-lambda
+# Reusable: build a Go AWS Lambda (arm64 bootstrap), zip, deploy via OIDC. Multi-env.
+# Mirrors BB *-token-function-go-lang pipelines.
+# Build e deploy no MESMO job (sem upload/download-artifact — cota de storage esgotava e travava a esteira).
+# O job `build` so roda quando NAO ha deploy (validacao de PR); o `deploy` rebuilda o zip nele mesmo.
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        type: string
+        default: "1.23"
+      function-name:
+        type: string
+        required: false
+      entry:
+        description: "diretorio do package main (ex.: ./cmd/lambda). Default = raiz."
+        type: string
+        default: "."
+      aws-region:
+        type: string
+        default: us-east-2
+      environment:
+        type: string
+        default: ""
+      deploy:
+        type: boolean
+        default: false
+    secrets:
+      AWS_OIDC_ROLE_ARN: { required: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Validacao (PR / branch sem deploy). Nao publica artifact — o zip morre com o job.
+  build:
+    if: ${{ !inputs.deploy }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ inputs.go-version }}', cache: true }
+      - name: Build bootstrap + zip
+        uses: tinnovatech/actions/build-lambda@v1
+        with:
+          goarch: arm64
+          zip: function.zip
+          entry: ${{ inputs.entry }}
+
+  # Self-contained: rebuilda o zip no proprio job e sobe. Sem dependencia de artifact storage.
+  deploy:
+    if: ${{ inputs.deploy }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment != '' && inputs.environment || (github.ref_name == 'main' && 'prd' || (github.ref_name == 'stage' && 'qas' || 'dev')) }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ inputs.go-version }}', cache: true }
+      - name: Build bootstrap + zip
+        uses: tinnovatech/actions/build-lambda@v1
+        with:
+          goarch: arm64
+          zip: function.zip
+          entry: ${{ inputs.entry }}
+      # AWS_OIDC_ROLE_ARN e checado dentro da composite aws-oidc-login.
+      - name: Validar inputs de deploy
+        env:
+          FUNCTION_NAME: ${{ inputs.function-name }}
+        run: |
+          set -euo pipefail
+          [ -n "$FUNCTION_NAME" ] || { echo "::error::input function-name vazio — nada a deployar"; exit 1; }
+          [ -f function.zip ] || { echo "::error::function.zip nao gerado pelo build"; exit 1; }
+      - uses: tinnovatech/actions/aws-oidc-login@v1
+        with:
+          role-arn: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+      - name: Update function code
+        run: aws lambda update-function-code --function-name "${{ inputs.function-name }}" --zip-file fileb://function.zip

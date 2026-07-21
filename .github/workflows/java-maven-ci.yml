@@ -1,0 +1,95 @@
+name: java-maven-ci
+# Reusable: Maven build+test+sonar, then optional Docker build&push (ECR via OIDC or DigitalOcean).
+# For the pom.xml-based services (customer-delivery, ms-integration-erp).
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        type: string
+        default: "17"
+      maven-args:
+        type: string
+        default: "clean verify"
+      run-sonar:
+        type: boolean
+        default: true
+      registry:
+        description: "ecr | digitalocean | none"
+        type: string
+        default: "ecr"
+      aws-region:
+        type: string
+        default: us-east-2
+      image-name:
+        type: string
+        default: ""
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+      push:
+        type: boolean
+        default: false
+    secrets:
+      SONAR_TOKEN: { required: false }
+      AWS_OIDC_ROLE_ARN: { required: false }
+      DIGITALOCEAN_ACCESS_TOKEN: { required: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+      - name: Build & test
+        run: mvn -B ${{ inputs.maven-args }}
+      - name: Sonar
+        if: ${{ inputs.run-sonar }}
+        uses: tinnovatech/actions/sonar-scan@v1
+        with:
+          sonar-token: ${{ secrets.SONAR_TOKEN }}
+  # Self-contained: rebuilda o maven aqui em vez de receber target/ por artifact.
+  # A cota de artifact storage da org estourava e travava a esteira inteira; o cache
+  # maven do setup-java deixa esse rebuild barato.
+  docker:
+    if: ${{ inputs.push }}
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+      - name: Build (para o Dockerfile)
+        run: mvn -B -DskipTests ${{ inputs.maven-args }}
+      - if: ${{ inputs.registry == 'ecr' }}
+        uses: tinnovatech/actions/aws-oidc-login@v1
+        with: { role-arn: '${{ secrets.AWS_OIDC_ROLE_ARN }}', aws-region: '${{ inputs.aws-region }}' }
+      - if: ${{ inputs.registry == 'ecr' }}
+        uses: aws-actions/amazon-ecr-login@v2
+      - if: ${{ inputs.registry == 'digitalocean' }}
+        uses: tinnovatech/actions/do-registry-login@v1
+        with: { do-token: '${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}' }
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ inputs.image-name }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,19 @@
+name: build-lambda
+description: Build a Go AWS Lambda (arm64 bootstrap) and zip it. Shell orchestrated via Taskfile.
+inputs:
+  goarch: { description: target arch, required: false, default: arm64 }
+  entry:  { description: main package dir or file, required: false, default: "." }
+  zip:    { description: output zip name, required: false, default: function.zip }
+runs:
+  using: composite
+  steps:
+    - name: Install task
+      shell: bash
+      run: sh -c "$(curl -sSL https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+    - name: Build (Taskfile)
+      shell: bash
+      env:
+        GOARCH_IN: ${{ inputs.goarch }}
+        ENTRY: ${{ inputs.entry }}
+        ZIP: ${{ inputs.zip }}
+      run: task --dir "$GITHUB_WORKSPACE" -t "${{ github.action_path }}/Taskfile.yml" build

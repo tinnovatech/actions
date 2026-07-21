@@ -1,0 +1,24 @@
+name: sonar-scan
+description: Run SonarCloud/SonarQube analysis.
+inputs:
+  sonar-token:
+    description: Sonar token (secret SONAR_TOKEN)
+    required: true
+  sonar-host:
+    description: Sonar host URL
+    required: false
+    default: https://sonarcloud.io
+  args:
+    description: Extra scanner args
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: SonarQube Scan
+      uses: SonarSource/sonarqube-scan-action@v6
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar-token }}
+        SONAR_HOST_URL: ${{ inputs.sonar-host }}
+      with:
+        args: ${{ inputs.args }}

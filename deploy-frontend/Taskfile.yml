@@ -1,0 +1,116 @@
+version: '3'
+# Orquestra o deploy S3 + CloudFront com guard-rails.
+# Inputs via env: DIST, BUCKET, CF_ID, SITE_URL (opcional), MARKER (opcional).
+#
+# Guard-rails (evita o incidente de deploy quebrado):
+#   1. preflight  -> valida o build ANTES de tocar no S3 (dist nao-vazio, index.html com marcador)
+#   2. smoke      -> valida o site AO VIVO depois do deploy (HTTP 200 + marcador), com retry
+#   3. rollback   -> volta o index.html para a versao anterior via versionamento do bucket
+
+tasks:
+  deploy:
+    desc: Preflight -> sync assets -> upload index -> invalidate -> smoke test
+    cmds:
+      - task: preflight
+      - task: sync-assets
+      - task: upload-index
+      - task: invalidate
+      - task: smoke
+
+  # ---- 1. Barreira de entrada: build ruim nunca chega no bucket ----
+  preflight:
+    internal: true
+    desc: Valida o artefato de build antes de publicar
+    cmds:
+      - |
+        set -eu
+        : "${BUCKET:?BUCKET is required}"
+        : "${DIST:?DIST is required}"
+        # dist precisa existir e ter conteudo
+        test -d "$DIST" || { echo "::error::DIST '$DIST' nao existe"; exit 1; }
+        test -f "$DIST/index.html" || { echo "::error::index.html ausente em '$DIST' — build invalido"; exit 1; }
+        # index.html nao pode ser trivial (build vazio gera arquivo minusculo)
+        SIZE=$(wc -c < "$DIST/index.html" | tr -d ' ')
+        test "$SIZE" -ge 200 || { echo "::error::index.html suspeito (${SIZE} bytes) — provavel build vazio"; exit 1; }
+        # precisa haver assets buildados (js/css)
+        ASSETS=$(find "$DIST" -type f \( -name '*.js' -o -name '*.css' \) | wc -l | tr -d ' ')
+        test "$ASSETS" -ge 1 || { echo "::error::nenhum asset .js/.css em '$DIST' — build incompleto"; exit 1; }
+        # se MARKER definido, index.html precisa conte-lo (ex: <title>Crava)
+        if [ -n "${MARKER:-}" ]; then
+          grep -qF "$MARKER" "$DIST/index.html" || { echo "::error::marcador '$MARKER' ausente no index.html — build errado"; exit 1; }
+        fi
+        echo "preflight OK — index.html ${SIZE}b, ${ASSETS} assets"
+
+  sync-assets:
+    internal: true
+    cmd: >
+      aws s3 sync "$DIST" "s3://$BUCKET"
+      --delete --exclude index.html
+      --cache-control "public,max-age=31536000,immutable"
+
+  upload-index:
+    internal: true
+    cmd: >
+      aws s3 cp "$DIST/index.html" "s3://$BUCKET/index.html"
+      --cache-control "no-cache,no-store,must-revalidate"
+      --content-type "text/html; charset=utf-8"
+
+  invalidate:
+    internal: true
+    status:
+      - test -z "$CF_ID"
+    cmd: aws cloudfront create-invalidation --distribution-id "$CF_ID" --paths "/*"
+
+  # ---- 2. Barreira de saida: site quebrado falha o pipeline (nao passa silencioso) ----
+  smoke:
+    internal: true
+    desc: Verifica o site ao vivo (HTTP 200 + marcador). Sem SITE_URL, faz no-op.
+    cmds:
+      - |
+        set -eu
+        if [ -z "${SITE_URL:-}" ]; then
+          echo "smoke: SITE_URL nao definido — pulando (recomendado configurar)"
+          exit 0
+        fi
+        echo "smoke: validando $SITE_URL ..."
+        for i in 1 2 3 4 5 6; do
+          CODE=$(curl -s -o /tmp/smoke_body.html -w '%{http_code}' --max-time 15 "$SITE_URL" || echo 000)
+          if [ "$CODE" = "200" ]; then
+            if [ -n "${MARKER:-}" ]; then
+              if grep -qF "$MARKER" /tmp/smoke_body.html; then
+                echo "smoke OK — 200 + marcador presente (tentativa $i)"; exit 0
+              else
+                echo "smoke: 200 mas marcador '$MARKER' ausente (tentativa $i)"
+              fi
+            else
+              echo "smoke OK — 200 (tentativa $i)"; exit 0
+            fi
+          else
+            echo "smoke: HTTP $CODE (tentativa $i)"
+          fi
+          sleep 8
+        done
+        echo "::error::SMOKE TEST FALHOU — $SITE_URL nao respondeu 200+marcador. Deploy considerado FALHO — rode rollback."
+        exit 1
+
+  # ---- 3. Recuperacao imediata: volta index.html para a versao anterior ----
+  rollback:
+    desc: Restaura o index.html para a versao imediatamente anterior (S3 versioning)
+    cmds:
+      - |
+        set -eu
+        : "${BUCKET:?BUCKET is required}"
+        echo "rollback: buscando versoes de index.html em s3://$BUCKET ..."
+        # pega a 2a versao mais recente (a anterior a atual)
+        PREV=$(aws s3api list-object-versions --bucket "$BUCKET" --prefix index.html \
+          --query 'reverse(sort_by(Versions,&LastModified))[1].VersionId' --output text)
+        test "$PREV" != "None" -a -n "$PREV" || { echo "::error::sem versao anterior para rollback"; exit 1; }
+        aws s3api copy-object --bucket "$BUCKET" --key index.html \
+          --copy-source "$BUCKET/index.html?versionId=$PREV" \
+          --metadata-directive REPLACE \
+          --cache-control "no-cache,no-store,must-revalidate" \
+          --content-type "text/html; charset=utf-8"
+        echo "rollback: index.html restaurado para versao $PREV"
+        if [ -n "${CF_ID:-}" ]; then
+          aws cloudfront create-invalidation --distribution-id "$CF_ID" --paths "/*"
+        fi

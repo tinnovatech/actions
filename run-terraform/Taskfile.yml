@@ -1,0 +1,13 @@
+version: '3'
+# Inputs via env: WORKDIR, TG_ACTION (plan|apply). AWS auth done by the workflow before this.
+env:
+  TG_NON_INTERACTIVE: "true"
+tasks:
+  run:
+    desc: terragrunt run-all <plan|apply> in WORKDIR
+    dir: "{{.WORKDIR}}"
+    cmds:
+      - terragrunt run-all "${TG_ACTION:-plan}" --terragrunt-non-interactive
+    vars:
+      WORKDIR:
+        sh: echo "${WORKDIR:-env}"

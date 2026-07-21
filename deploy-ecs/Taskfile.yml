@@ -1,0 +1,87 @@
+version: '3'
+# Orchestrates the ECS deploy. Inputs arrive as env vars:
+# IMAGE_NAME, IMAGE_TAG, DOCKERFILE, CLUSTER, SERVICE, AWS_REGION, WAIT, GIT_SHA,
+# CIRCUIT_BREAKER (default true), WAIT_TIMEOUT (default 900).
+# AWS creds are already in the environment (aws-oidc-login ran first). ECR account = current identity.
+tasks:
+  deploy:
+    preconditions:
+      - sh: test -n "$IMAGE_NAME"
+        msg: "IMAGE_NAME is required"
+      - sh: test -n "$IMAGE_TAG"
+        msg: "IMAGE_TAG is required"
+      - sh: test -n "$CLUSTER"
+        msg: "CLUSTER is required"
+      - sh: test -n "$SERVICE"
+        msg: "SERVICE is required"
+    cmds:
+      - task: build-push
+      - task: rollout
+
+  build-push:
+    internal: true
+    cmds:
+      - |
+        set -e
+        ACCT=$(aws sts get-caller-identity --query Account --output text)
+        ECR="${ACCT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        SHA=$(echo "$GIT_SHA" | cut -c1-7)
+        docker build -f "$DOCKERFILE" \
+          -t "$ECR/$IMAGE_NAME:$IMAGE_TAG" \
+          -t "$ECR/$IMAGE_NAME:$SHA" .
+        docker push "$ECR/$IMAGE_NAME:$IMAGE_TAG"
+        docker push "$ECR/$IMAGE_NAME:$SHA"
+
+  rollout:
+    internal: true
+    cmds:
+      # Force a new deployment. With CIRCUIT_BREAKER=true (default) ECS gains
+      # deploymentCircuitBreaker{enable,rollback}: the rollout completes OR rolls
+      # back to the last healthy task set server-side, independent of this runner.
+      # So a spot runner reclaimed mid-wait no longer reds a deploy that actually
+      # succeeded (nor leaves a broken one green). Existing min/max healthy percent
+      # are preserved so this is safe to turn on for every service.
+      - |
+        set -e
+        if [ "${CIRCUIT_BREAKER:-true}" = "true" ]; then
+          set -- $(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+                    --query 'services[0].deploymentConfiguration.[maximumPercent,minimumHealthyPercent]' \
+                    --output text 2>/dev/null)
+          MAXP=${1:-200}; MINP=${2:-100}
+          [ "$MAXP" = "None" ] && MAXP=200; [ "$MINP" = "None" ] && MINP=100
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+            --force-new-deployment \
+            --deployment-configuration "deploymentCircuitBreaker={enable=true,rollback=true},maximumPercent=$MAXP,minimumHealthyPercent=$MINP" >/dev/null
+        else
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment >/dev/null
+        fi
+      # Fire-and-trust by default (WAIT=false). The runners are ephemeral spot
+      # instances: blocking here for minutes is exactly what gets the runner
+      # reclaimed mid-wait and reds a deploy that actually succeeded. update-service
+      # is synchronous — once it returns, ECS has accepted the new deployment and
+      # (with the circuit breaker above) will drive it to COMPLETED or roll back on
+      # its own, server-side, whether or not this runner survives. So the pipeline
+      # goes green as soon as the rollout is handed off to ECS.
+      #
+      # Opt in to WAIT=true only on a stable (non-spot / hosted) runner where you
+      # want the job to block on the outcome. There the poll below watches the
+      # PRIMARY deployment's rolloutState and fails fast on FAILED.
+      - |
+        if [ "$WAIT" != "true" ]; then
+          echo "rollout handed off to ECS (circuit breaker owns completion/rollback server-side) — not blocking this runner"
+          exit 0
+        fi
+        echo "waiting for $SERVICE deployment to reach steady state..."
+        DEADLINE=$(( $(date +%s) + ${WAIT_TIMEOUT:-900} ))
+        while :; do
+          ST=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+                --query 'services[0].deployments[?status==`PRIMARY`].rolloutState | [0]' \
+                --output text 2>/dev/null || echo UNKNOWN)
+          echo "  rolloutState=$ST"
+          case "$ST" in
+            COMPLETED) echo "deploy OK"; exit 0 ;;
+            FAILED)    echo "deploy FAILED — circuit breaker rolled back to last healthy task set"; exit 1 ;;
+          esac
+          [ "$(date +%s)" -ge "$DEADLINE" ] && { echo "wait timeout after ${WAIT_TIMEOUT:-900}s (deployment still IN_PROGRESS)"; exit 1; }
+          sleep 15
+        done

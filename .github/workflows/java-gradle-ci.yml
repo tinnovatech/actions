@@ -1,0 +1,128 @@
+name: java-gradle-ci
+# Reusable: build+test+sonar, then build&push Docker image (ECR via OIDC or DigitalOcean).
+# Mirrors the BB gradle-devops pipeline pattern used by the *-service repos.
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        type: string
+        default: "17"
+      gradle-args:
+        type: string
+        default: "clean build -x test --no-daemon"
+      run-sonar:
+        type: boolean
+        default: true
+      registry:
+        description: "ecr | digitalocean | none"
+        type: string
+        default: "ecr"
+      aws-region:
+        type: string
+        default: us-east-2
+      image-name:
+        description: "full image repo path (without tag)"
+        type: string
+        default: ""
+      dockerfile:
+        description: "path to Dockerfile"
+        type: string
+        default: "Dockerfile"
+      push:
+        description: "build & push docker image"
+        type: boolean
+        default: false
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      AWS_OIDC_ROLE_ARN:
+        required: false
+      DIGITALOCEAN_ACCESS_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+      - uses: gradle/actions/setup-gradle@v4
+      # use the repo's wrapper (pinned Gradle version) when present; fall back to system gradle
+      - name: Build
+        run: |
+          if [ -x ./gradlew ] || [ -f ./gradlew ]; then chmod +x ./gradlew; ./gradlew ${{ inputs.gradle-args }}; else gradle ${{ inputs.gradle-args }}; fi
+      # O test roda num invocation separado do build, entao flags globais passadas em
+      # gradle-args (ex.: --dependency-verification off, quando o verification-metadata
+      # do repo esta desatualizado) precisam ser repropagadas aqui — senao o build passa
+      # e o test morre resolvendo as mesmas dependencias.
+      - name: Test
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+          GRADLE_ARGS: ${{ inputs.gradle-args }}
+        run: |
+          extra=""
+          case "$GRADLE_ARGS" in
+            *"--dependency-verification off"*) extra="--dependency-verification off" ;;
+          esac
+          if [ -f ./gradlew ]; then ./gradlew test --no-daemon $extra; else gradle test --no-daemon $extra; fi
+      - name: Sonar
+        if: ${{ inputs.run-sonar }}
+        uses: tinnovatech/actions/sonar-scan@v1
+        with:
+          sonar-token: ${{ secrets.SONAR_TOKEN }}
+  # Self-contained: rebuilda o gradle aqui em vez de receber build/ por artifact.
+  # A cota de artifact storage da org estourava e travava a esteira inteira; o cache do
+  # setup-gradle deixa esse rebuild barato.
+  docker:
+    if: ${{ inputs.push }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC for ECR
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+      - uses: gradle/actions/setup-gradle@v4
+      # Dockerfiles fazem COPY build/distributions/*.tar
+      - name: Build (para o Dockerfile)
+        run: |
+          if [ -x ./gradlew ] || [ -f ./gradlew ]; then chmod +x ./gradlew; ./gradlew ${{ inputs.gradle-args }}; else gradle ${{ inputs.gradle-args }}; fi
+      - name: AWS OIDC (ECR)
+        if: ${{ inputs.registry == 'ecr' }}
+        uses: tinnovatech/actions/aws-oidc-login@v1
+        with:
+          role-arn: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+      - name: ECR login
+        if: ${{ inputs.registry == 'ecr' }}
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: DigitalOcean login
+        if: ${{ inputs.registry == 'digitalocean' }}
+        uses: tinnovatech/actions/do-registry-login@v1
+        with:
+          do-token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ inputs.image-name }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

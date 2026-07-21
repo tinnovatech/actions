@@ -1,0 +1,52 @@
+name: docker-image
+# Reusable: build & push a Docker image (base/tooling images) to DigitalOcean or ECR.
+# Mirrors BB vallepay-devops (builds the bun-devops / gradle-devops base images).
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: "digitalocean | ecr"
+        type: string
+        default: digitalocean
+      context:
+        description: build context dir
+        type: string
+        default: "."
+      image:
+        description: full image ref including tag
+        type: string
+        required: false
+      aws-region:
+        type: string
+        default: us-east-2
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN: { required: false }
+      AWS_OIDC_ROLE_ARN: { required: false }
+
+permissions:
+  contents: read
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - if: ${{ inputs.registry == 'digitalocean' }}
+        uses: tinnovatech/actions/do-registry-login@v1
+        with: { do-token: '${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}' }
+      - if: ${{ inputs.registry == 'ecr' }}
+        uses: tinnovatech/actions/aws-oidc-login@v1
+        with: { role-arn: '${{ secrets.AWS_OIDC_ROLE_ARN }}', aws-region: '${{ inputs.aws-region }}' }
+      - if: ${{ inputs.registry == 'ecr' }}
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          push: true
+          tags: ${{ inputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

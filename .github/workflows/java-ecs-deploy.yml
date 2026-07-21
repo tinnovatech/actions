@@ -1,0 +1,147 @@
+name: java-ecs-deploy
+# Reusable: Java/Gradle -> build -> deploy ECS (branch->conta/env) com runner self-hosted + fallback.
+# Um repo consome com ~8 linhas (uses + with + secrets: inherit). Mudou aqui = vale pra todos.
+#
+# runs-on dinamico: se houver runner self-hosted com o label <runner-label> online -> self-hosted (gratis);
+# senao -> ubuntu-latest (usa creditos GitHub). Deploy self-contained (sem artifact).
+#
+# Mapeamento de branch: develop->dev, stage->qas, main->prd.
+# Recursos derivados: cluster = <cluster-prefix>-<env> ; service = <image-name>-<env>-service ; tag = <env>.
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Nome do repo ECR + prefixo do service (ex.: crava-auth)"
+        type: string
+        required: true
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+      java-version:
+        type: string
+        default: "21"
+      gradle-build-args:
+        type: string
+        default: "clean build -x test -x ktlintCheck -x ktlintMainSourceSetCheck -x ktlintTestSourceSetCheck --no-daemon"
+      aws-region:
+        type: string
+        default: "us-east-1"
+      runner-label:
+        description: "Label do runner self-hosted (ex.: crava). Vazio = sempre ubuntu-latest."
+        type: string
+        default: ""
+      runner-org:
+        description: "Org GitHub p/ consultar runners online."
+        type: string
+        default: "tinnovatech"
+      cluster-prefix:
+        description: "Prefixo do cluster ECS (cluster = <prefix>-<env>)."
+        type: string
+        default: "crava"
+      run-sonar:
+        type: boolean
+        default: false
+      circuit-breaker:
+        description: "Habilita ECS deployment circuit breaker + rollback (self-heal server-side). Recomendado true."
+        type: boolean
+        default: true
+      wait:
+        description: "Bloquear o job ate o rollout terminar. Default false (fire-and-trust: circuit breaker cuida server-side). true so em runner estavel/nao-spot."
+        type: boolean
+        default: false
+      wait-timeout:
+        description: "Segundos maximos observando o rollout antes de falhar (so vale com wait=true)."
+        type: string
+        default: "900"
+    secrets:
+      RUNNERS_PAT:
+        description: "PAT p/ listar runners da org (fallback). Opcional."
+        required: false
+      AWS_OIDC_ROLE_ARN:
+        required: false
+      SONAR_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Escolhe onde rodar via composite action reusavel (self-hosted <label> se online, senao ubuntu-latest).
+  pick-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.pick.outputs.labels }}
+    steps:
+      - id: pick
+        uses: tinnovatech/actions/pick-runner@main
+        with:
+          label: ${{ inputs.runner-label }}
+          org: ${{ inputs.runner-org }}
+          token: ${{ secrets.RUNNERS_PAT }}
+
+  # PR: build + testes (+sonar). Sem artifact.
+  build-test:
+    needs: pick-runner
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.labels) }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "${{ inputs.java-version }}" }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build
+        run: |
+          [ -f ./gradlew ] && chmod +x ./gradlew
+          ./gradlew ${{ inputs.gradle-build-args }}
+      - name: Test
+        run: ./gradlew test --no-daemon
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+      - name: Sonar
+        if: ${{ inputs.run-sonar }}
+        uses: tinnovatech/actions/sonar-scan@v1
+        with:
+          sonar-token: ${{ secrets.SONAR_TOKEN }}
+
+  # push develop/stage/main: builda e deploya no mesmo job (sem artifact). OIDC por environment.
+  deploy:
+    needs: pick-runner
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/stage' || github.ref == 'refs/heads/main') }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.labels) }}
+    environment: ${{ github.ref_name == 'main' && 'prd' || github.ref_name == 'stage' && 'qas' || 'dev' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ENV: ${{ github.ref_name == 'main' && 'prd' || github.ref_name == 'stage' && 'qas' || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "${{ inputs.java-version }}" }
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build artifact
+        run: |
+          [ -f ./gradlew ] && chmod +x ./gradlew
+          ./gradlew ${{ inputs.gradle-build-args }}
+      - uses: tinnovatech/actions/aws-oidc-login@v1
+        with:
+          role-arn: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+      - name: Build image, push to ECR & roll out ECS
+        uses: tinnovatech/actions/deploy-ecs@v1
+        with:
+          image-name: ${{ inputs.image-name }}
+          image-tag: ${{ env.ENV }}
+          dockerfile: ${{ inputs.dockerfile }}
+          cluster: ${{ inputs.cluster-prefix }}-${{ env.ENV }}
+          service: ${{ inputs.image-name }}-${{ env.ENV }}-service
+          aws-region: ${{ inputs.aws-region }}
+          circuit-breaker: ${{ inputs.circuit-breaker }}
+          wait: ${{ inputs.wait }}
+          wait-timeout: ${{ inputs.wait-timeout }}

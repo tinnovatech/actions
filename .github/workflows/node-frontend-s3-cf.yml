@@ -1,0 +1,115 @@
+name: node-frontend-s3-cf
+# Reusable: build de frontend JS (npm ou bun) -> deploy S3 + invalidacao CloudFront via AWS OIDC.
+# Build e deploy no MESMO job (sem upload/download-artifact — cota de storage esgotava e travava a esteira).
+# runs-on dinamico: se runner-label tiver runner self-hosted online -> self-hosted; senao ubuntu-latest.
+on:
+  workflow_call:
+    inputs:
+      package-manager:
+        description: "npm | bun"
+        type: string
+        default: "npm"
+      node-version:
+        type: string
+        default: "22"
+      build-cmd:
+        type: string
+        default: "npm run build"
+      dist-dir:
+        type: string
+        default: "dist"
+      aws-region:
+        type: string
+        default: us-east-1
+      environment:
+        description: "Override do GH environment. Vazio = derivado do branch (main->prd, stage/qa/qas->qas, resto->dev)."
+        type: string
+        default: ""
+      site-url:
+        description: "URL publica p/ smoke test pos-deploy. Vazio = smoke pulado."
+        type: string
+        default: ""
+      marker:
+        description: "String obrigatoria no build e no site (ex: '<title>Crava')."
+        type: string
+        default: ""
+      runner-label:
+        description: "Label do runner self-hosted (ex.: crava). Vazio = sempre ubuntu-latest."
+        type: string
+        default: ""
+      runner-org:
+        description: "Org GitHub p/ o picker."
+        type: string
+        default: "tinnovatech"
+    secrets:
+      AWS_OIDC_ROLE_ARN: { required: false }
+      S3_BUCKET: { required: false }
+      CF_DISTRIBUTION_ID: { required: false }
+      RUNNERS_PAT: { required: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Resolve onde rodar (self-hosted vs hosted) + qual environment (branch->env).
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.pick.outputs.labels }}
+      env: ${{ steps.map.outputs.env }}
+    steps:
+      - id: pick
+        uses: tinnovatech/actions/pick-runner@main
+        with:
+          label: ${{ inputs.runner-label }}
+          org: ${{ inputs.runner-org }}
+          token: ${{ secrets.RUNNERS_PAT }}
+      - id: map
+        shell: bash
+        run: |
+          case "${{ github.ref_name }}" in
+            main)          e=prd ;;
+            stage|qa|qas)  e=qas ;;
+            *)             e=dev ;;
+          esac
+          [ -n "${{ inputs.environment }}" ] && e="${{ inputs.environment }}"
+          echo "env=$e" >> "$GITHUB_OUTPUT"
+          echo "environment=$e runner=${{ steps.pick.outputs.labels }} (branch=${{ github.ref_name }})"
+
+  # Build + deploy no mesmo job (dist fica no workspace, sem artifact).
+  deploy:
+    needs: prepare
+    runs-on: ${{ fromJSON(needs.prepare.outputs.labels) }}
+    environment: ${{ needs.prepare.outputs.env }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DEPLOY_ENV: ${{ needs.prepare.outputs.env }} # caller usa em build-cmd: bun run build --mode $DEPLOY_ENV
+    steps:
+      - uses: actions/checkout@v4
+      - if: ${{ inputs.package-manager == 'bun' }}
+        uses: oven-sh/setup-bun@v2
+      - if: ${{ inputs.package-manager == 'npm' }}
+        uses: actions/setup-node@v4
+        with: { node-version: "${{ inputs.node-version }}", cache: npm }
+      - name: Install
+        run: ${{ inputs.package-manager == 'bun' && 'bun install --frozen-lockfile' || 'npm ci' }}
+      - name: Build (DEPLOY_ENV=${{ needs.prepare.outputs.env }})
+        run: ${{ inputs.build-cmd }}
+      - uses: tinnovatech/actions/aws-oidc-login@v1
+        with:
+          role-arn: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+      - name: Deploy to S3 + CloudFront
+        uses: tinnovatech/actions/deploy-frontend@v1
+        with:
+          dist-dir: ${{ inputs.dist-dir }}
+          bucket: ${{ secrets.S3_BUCKET }}
+          distribution-id: ${{ secrets.CF_DISTRIBUTION_ID }}
+          site-url: ${{ inputs.site-url != '' && inputs.site-url || vars.SMOKE_URL }}
+          marker: ${{ inputs.marker != '' && inputs.marker || vars.SMOKE_MARKER }}

@@ -1,0 +1,200 @@
+name: terraform-ci
+# Reusable: Terraform PURO (sem terragrunt) com varios root modules independentes.
+# Layout esperado: <root-dir>/<env>/.../<componente>/ cada um com seu backend "s3".
+#
+# Em pull_request planeja SO os root modules tocados pela PR; em push/dispatch varre todos.
+# Use terraform-terragrunt.yml quando o repo tiver terragrunt.hcl — este aqui e o oposto.
+on:
+  workflow_call:
+    inputs:
+      tf-version:
+        type: string
+        default: "1.9"
+      root-dir:
+        description: "raiz onde ficam os root modules (ex.: environments)"
+        type: string
+        default: "environments"
+      aws-region:
+        type: string
+        default: us-east-2
+      apply:
+        description: "roda apply nos modules planejados (exige aprovacao do environment)"
+        type: boolean
+        default: false
+      apply-exclude:
+        description: >
+          Root modules que NAO entram no apply automatico (uma substring por linha).
+          Continuam sendo planejados; o apply deles fica manual. Use para modules
+          cujo plan tem replace/destroy de recurso critico.
+        type: string
+        default: ""
+      environment:
+        type: string
+        default: ""
+    secrets:
+      AWS_OIDC_ROLE_ARN: { required: false }
+      # Modulos que falam com o Cloudflare exigem TF_VAR_cloudflare_api_token
+      # (variavel sensivel, nunca em terraform.tfvars).
+      CLOUDFLARE_API_TOKEN: { required: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false   # nunca cancelar infra no meio
+
+jobs:
+  # Descobre quais root modules planejar. Root module = diretorio com bloco backend "s3".
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      dirs: ${{ steps.set.outputs.dirs }}
+      count: ${{ steps.set.outputs.count }}
+      apply_dirs: ${{ steps.set.outputs.apply_dirs }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: set
+        env:
+          ROOT: ${{ inputs.root-dir }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          APPLY_EXCLUDE: ${{ inputs.apply-exclude }}
+        run: |
+          set -euo pipefail
+          # todo diretorio que declara backend s3 e um root module
+          mapfile -t all < <(grep -rl --include='*.tf' 'backend "s3"' "$ROOT" 2>/dev/null \
+                             | xargs -r -n1 dirname | sort -u)
+          if [ "${#all[@]}" -eq 0 ]; then
+            echo "::error::nenhum root module com backend \"s3\" sob '$ROOT'"; exit 1
+          fi
+
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ -n "${BASE_SHA:-}" ]; then
+            # planeja so o que a PR tocou; modules/ e shared/ sao compartilhados -> planeja tudo
+            mapfile -t changed < <(git diff --name-only "$BASE_SHA"...HEAD)
+            if printf '%s\n' "${changed[@]}" | grep -qE '^(modules|shared)/'; then
+              echo "  modules/ ou shared/ mudou -> planejando todos"
+              sel=("${all[@]}")
+            else
+              sel=()
+              for d in "${all[@]}"; do
+                printf '%s\n' "${changed[@]}" | grep -q "^$d/" && sel+=("$d")
+              done
+            fi
+          else
+            sel=("${all[@]}")
+          fi
+
+          n=${#sel[@]}
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          if [ "$n" -eq 0 ]; then
+            echo "dirs=[]" >> "$GITHUB_OUTPUT"
+            echo "nenhum root module afetado por esta PR — plan sera pulado"
+          else
+            printf '%s\n' "${sel[@]}" | sed 's/^/  /'
+            echo "dirs=$(printf '%s\n' "${sel[@]}" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Lista do APPLY = lista do plan menos os excluidos. O module excluido
+          # continua planejado (o time ve o diff) mas nao aplica sozinho.
+          app=()
+          for d in "${sel[@]:-}"; do
+            [ -z "$d" ] && continue
+            skip=""
+            while IFS= read -r pat; do
+              [ -z "$pat" ] && continue
+              case "$d" in *"$pat"*) skip=1 ;; esac
+            done <<< "${APPLY_EXCLUDE:-}"
+            if [ -n "$skip" ]; then
+              echo "  [apply-exclude] $d — plan sim, apply manual"
+            else
+              app+=("$d")
+            fi
+          done
+          if [ "${#app[@]}" -eq 0 ]; then
+            echo "apply_dirs=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "apply_dirs=$(printf '%s\n' "${app[@]}" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+          fi
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: '${{ inputs.tf-version }}' }
+      - name: fmt
+        run: terraform fmt -check -recursive
+      - uses: terraform-linters/setup-tflint@v4
+      - name: tflint
+        run: tflint --recursive || echo "tflint com apontamentos (nao bloqueante)"
+
+  plan:
+    needs: [discover, validate]
+    if: ${{ needs.discover.outputs.dirs != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false          # um module quebrado nao esconde o resultado dos outros
+      max-parallel: 6
+      matrix:
+        dir: ${{ fromJson(needs.discover.outputs.dirs) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: tinnovatech/actions/aws-oidc-login@v1
+        with:
+          role-arn: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: '${{ inputs.tf-version }}' }
+      - name: init
+        working-directory: ${{ matrix.dir }}
+        run: terraform init -input=false -no-color
+      - name: plan
+        working-directory: ${{ matrix.dir }}
+        env:
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        # -lock=false: plan nao precisa do lock e evita contencao entre os jobs da matrix
+        run: |
+          # secret ausente chega como string vazia — o terraform aceitaria isso como
+          # "valor fornecido" e a falha so apareceria depois, como erro de auth do
+          # provider. Desfazendo, o erro volta a ser o claro "required variable".
+          [ -n "${TF_VAR_cloudflare_api_token:-}" ] || unset TF_VAR_cloudflare_api_token
+          terraform plan -input=false -no-color -lock=false
+
+  apply:
+    needs: [discover, plan]
+    if: ${{ inputs.apply && needs.discover.outputs.apply_dirs != '[]' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment != '' && inputs.environment || (github.ref_name == 'main' && 'prd' || 'dev') }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      # Root modules sao independentes (state proprio por module). Com fail-fast
+      # um AccessDenied num module cancelava o apply de todos os outros, inclusive
+      # os que nao tinham nada a ver — foi o que aconteceu em 2026-07-21.
+      fail-fast: false
+      max-parallel: 1           # apply serializado
+      matrix:
+        dir: ${{ fromJson(needs.discover.outputs.apply_dirs) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: tinnovatech/actions/aws-oidc-login@v1
+        with:
+          role-arn: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: '${{ inputs.tf-version }}' }
+      - name: init
+        working-directory: ${{ matrix.dir }}
+        run: terraform init -input=false -no-color
+      - name: apply
+        working-directory: ${{ matrix.dir }}
+        env:
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          [ -n "${TF_VAR_cloudflare_api_token:-}" ] || unset TF_VAR_cloudflare_api_token
+          terraform apply -input=false -no-color -auto-approve

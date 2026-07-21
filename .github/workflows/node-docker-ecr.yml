@@ -1,0 +1,78 @@
+name: node-docker-ecr
+# Reusable: build a JS app (npm/bun) then docker build + push to ECR (OIDC).
+# For containerized frontends (checkout-front, management-front) that ship as images, not S3.
+on:
+  workflow_call:
+    inputs:
+      package-manager: { type: string, default: "npm" }   # npm | bun
+      node-version:    { type: string, default: "22" }
+      build-cmd:       { type: string, default: "npm run build" }
+      dockerfile:      { type: string, default: "Dockerfile" }
+      image-name:      { type: string, required: true }     # ECR repo path (no tag)
+      aws-region:      { type: string, default: "us-east-2" }
+      push:            { type: boolean, default: false }
+    secrets:
+      AWS_OIDC_ROLE_ARN: { required: false }
+      # Variaveis exigidas em BUILD time (Next valida env no build e aborta se faltar).
+      # Formato dotenv, uma por linha: NOME=valor. Equivalem as deployment variables
+      # do Bitbucket, que nao vieram na migracao — sem isso o build quebra com
+      # "Missing required environment variable".
+      BUILD_ENV: { required: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - if: ${{ inputs.package-manager == 'bun' }}
+        uses: oven-sh/setup-bun@v2
+      - if: ${{ inputs.package-manager == 'npm' }}
+        uses: actions/setup-node@v4
+        with: { node-version: '${{ inputs.node-version }}', cache: npm }
+      - name: Install
+        # não-frozen: lockfiles podem ter sido gerados com bun/npm de versão diferente
+        run: ${{ inputs.package-manager == 'bun' && 'bun install' || 'npm ci || npm install' }}
+      # Escreve o .env antes do build. Os valores ficam mascarados no log pelo
+      # proprio Actions (vem de secret) e o arquivo morre com o runner.
+      # O contexto `secrets` NAO e valido em `if:` de step (o workflow nem inicia:
+      # startup_failure). Por isso o teste de vazio vai dentro do run.
+      - name: Env de build
+        env:
+          BUILD_ENV: ${{ secrets.BUILD_ENV }}
+        run: |
+          if [ -z "${BUILD_ENV:-}" ]; then
+            echo "BUILD_ENV nao definido — seguindo sem .env"
+            exit 0
+          fi
+          printf '%s\n' "$BUILD_ENV" > .env
+          echo "variaveis carregadas: $(grep -cE '^[A-Za-z_]+=' .env)"
+          grep -oE '^[A-Za-z_]+' .env | sed 's/^/  /'
+      - name: Build
+        run: ${{ inputs.build-cmd }}
+      # docker build + push (only when push=true)
+      - if: ${{ inputs.push }}
+        uses: tinnovatech/actions/aws-oidc-login@v1
+        with: { role-arn: '${{ secrets.AWS_OIDC_ROLE_ARN }}', aws-region: '${{ inputs.aws-region }}' }
+      - if: ${{ inputs.push }}
+        uses: aws-actions/amazon-ecr-login@v2
+      - if: ${{ inputs.push }}
+        uses: docker/setup-buildx-action@v3
+      - if: ${{ inputs.push }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ inputs.image-name }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

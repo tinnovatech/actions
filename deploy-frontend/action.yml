@@ -1,0 +1,23 @@
+name: deploy-frontend
+description: Deploy a built frontend to S3 + CloudFront, with pre-deploy validation and post-deploy smoke test. Shell orchestrated via Taskfile.
+inputs:
+  dist-dir:        { description: built assets dir, required: true }
+  bucket:          { description: S3 bucket, required: true }
+  distribution-id: { description: CloudFront distribution id, required: true }
+  site-url:        { description: "URL publica para smoke test pos-deploy (ex: https://cravabrasil.com.br). Sem ela, o smoke test e pulado.", required: false, default: "" }
+  marker:          { description: "String que precisa existir no build e no site (ex: '<title>Crava'). Valida build correto + site no ar.", required: false, default: "" }
+runs:
+  using: composite
+  steps:
+    - name: Install task
+      shell: bash
+      run: sh -c "$(curl -sSL https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+    - name: Deploy (Taskfile)
+      shell: bash
+      env:
+        DIST: ${{ inputs.dist-dir }}
+        BUCKET: ${{ inputs.bucket }}
+        CF_ID: ${{ inputs.distribution-id }}
+        SITE_URL: ${{ inputs.site-url }}
+        MARKER: ${{ inputs.marker }}
+      run: task --dir "$GITHUB_WORKSPACE" -t "${{ github.action_path }}/Taskfile.yml" deploy

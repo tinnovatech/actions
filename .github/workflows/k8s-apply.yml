@@ -1,0 +1,82 @@
+name: k8s-apply
+# Reusable: kubectl apply manifests to a cluster. Supports DigitalOcean (DOKS) and AWS (EKS).
+# Mirrors BB *-k8s pipelines (orkestral-k8s, vallepay-k8s = DOKS; tr4ck-k8s = EKS).
+on:
+  workflow_call:
+    inputs:
+      provider:
+        description: "doks | eks"
+        type: string
+        required: false
+      cluster:
+        description: cluster name
+        type: string
+        required: false
+      manifest-dir:
+        description: "directory of manifests to apply (-R -f), ou um manifest unico"
+        type: string
+        required: false
+      aws-region:
+        type: string
+        default: us-east-1
+      namespace-file:
+        description: optional namespace manifest applied first
+        type: string
+        default: ""
+      rollout-restart:
+        description: "workload reiniciado apos o apply (ex.: deployment/foo). Obrigatorio com tag mutavel"
+        type: string
+        default: ""
+      namespace:
+        description: namespace do rollout restart
+        type: string
+        default: default
+      environment:
+        type: string
+        default: ""
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN: { required: false }
+      AWS_OIDC_ROLE_ARN: { required: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.environment }}-${{ inputs.cluster }}
+  cancel-in-progress: false   # never cancel a deploy mid-apply
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    # branch qas existe nos repos Orkestral; stage e a convencao dos demais
+    environment: ${{ inputs.environment != '' && inputs.environment || (github.ref_name == 'main' && 'prd' || ((github.ref_name == 'stage' || github.ref_name == 'qas') && 'qas' || 'dev')) }}
+    permissions:
+      contents: read
+      id-token: write   # EKS OIDC
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- auth (provider-specific, uses secrets) ---
+      - name: DOKS auth
+        if: ${{ inputs.provider == 'doks' }}
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - name: EKS OIDC
+        if: ${{ inputs.provider == 'eks' }}
+        uses: tinnovatech/actions/aws-oidc-login@v1
+        with:
+          role-arn: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # --- kubeconfig + apply (Taskfile-orchestrated composite) ---
+      - name: Apply manifests
+        uses: tinnovatech/actions/deploy-k8s@v1
+        with:
+          provider: ${{ inputs.provider }}
+          cluster: ${{ inputs.cluster }}
+          manifest-dir: ${{ inputs.manifest-dir }}
+          namespace-file: ${{ inputs.namespace-file }}
+          rollout-restart: ${{ inputs.rollout-restart }}
+          namespace: ${{ inputs.namespace }}
+          aws-region: ${{ inputs.aws-region }}

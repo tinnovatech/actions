@@ -1,0 +1,13 @@
+version: '3'
+# Inputs via env: GOARCH_IN, ENTRY, ZIP. Produces $ZIP with the `bootstrap` binary.
+tasks:
+  build:
+    desc: Build a static arm64 bootstrap for AWS Lambda (provided.al2) and zip it
+    cmds:
+      - go mod download
+      - go mod verify
+      # build the package in the current dir (handles main.go, Handler.go, any entry filename)
+      - GOOS=linux CGO_ENABLED=0 GOARCH="${GOARCH_IN:-arm64}" go build -tags lambda.norpc -o bootstrap "${ENTRY:-.}"
+      - zip "${ZIP:-function.zip}" bootstrap
+    generates:
+      - "{{.ZIP | default \"function.zip\"}}"

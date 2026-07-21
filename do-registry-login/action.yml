@@ -1,0 +1,19 @@
+name: do-registry-login
+description: Log in to DigitalOcean container registry (mirrors BB $DIGITALOCEAN_ACCESS_TOKEN pattern).
+inputs:
+  do-token:
+    description: DigitalOcean access token (secret DIGITALOCEAN_ACCESS_TOKEN)
+    required: true
+  registry:
+    description: Registry host
+    required: false
+    default: registry.digitalocean.com
+runs:
+  using: composite
+  steps:
+    - name: Docker login (DigitalOcean)
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.do-token }}
+        password: ${{ inputs.do-token }}

@@ -1,0 +1,86 @@
+name: terraform-terragrunt
+# Reusable: fmt -> tflint -> checkov -> terragrunt plan (-> apply, gated by environment).
+# Mirrors BB infra pipelines (terraform, crava-infra, *-k8s, *-devops).
+on:
+  workflow_call:
+    inputs:
+      tf-version:
+        type: string
+        default: "1.9"
+      tg-version:
+        type: string
+        default: "0.67.0"
+      working-dir:
+        type: string
+        default: "env"
+      aws-region:
+        type: string
+        default: us-east-2
+      apply:
+        description: run terragrunt apply (only after environment approval)
+        type: boolean
+        default: false
+      environment:
+        type: string
+        default: ""
+    secrets:
+      AWS_OIDC_ROLE_ARN: { required: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false   # never cancel infra mid-apply
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: '${{ inputs.tf-version }}' }
+      - name: fmt
+        run: terraform fmt -check -recursive "${{ inputs.working-dir }}/"
+      - name: tflint
+        uses: terraform-linters/setup-tflint@v4
+      - run: tflint --recursive || echo "tflint issues (non-blocking)"
+      - name: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with: { directory: '${{ inputs.working-dir }}', soft_fail: true }
+
+  plan:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: tinnovatech/actions/aws-oidc-login@v1
+        with: { role-arn: '${{ secrets.AWS_OIDC_ROLE_ARN }}', aws-region: '${{ inputs.aws-region }}' }
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: '${{ inputs.tf-version }}' }
+      - name: terragrunt plan
+        uses: tinnovatech/actions/run-terraform@v1
+        with:
+          working-dir: ${{ inputs.working-dir }}
+          action: plan
+          tg-version: ${{ inputs.tg-version }}
+
+  apply:
+    needs: plan
+    if: ${{ inputs.apply }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment != '' && inputs.environment || (github.ref_name == 'main' && 'prd' || (github.ref_name == 'stage' && 'qas' || 'dev')) }}   # prd = required reviewers
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: tinnovatech/actions/aws-oidc-login@v1
+        with: { role-arn: '${{ secrets.AWS_OIDC_ROLE_ARN }}', aws-region: '${{ inputs.aws-region }}' }
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: '${{ inputs.tf-version }}' }
+      - name: terragrunt apply
+        uses: tinnovatech/actions/run-terraform@v1
+        with:
+          working-dir: ${{ inputs.working-dir }}
+          action: apply
+          tg-version: ${{ inputs.tg-version }}

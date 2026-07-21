@@ -1,0 +1,45 @@
+name: pick-runner
+description: >
+  Decide o runs-on: se houver runner self-hosted com <label> online na org -> self-hosted;
+  senao -> ubuntu-latest (usa creditos GitHub). Saida 'labels' para usar com fromJSON em runs-on.
+inputs:
+  label:
+    description: "Label do runner self-hosted (ex.: crava). Vazio = sempre ubuntu-latest."
+    required: false
+    default: ""
+  org:
+    description: "Org GitHub para consultar runners."
+    required: false
+    default: "tinnovatech"
+  token:
+    description: "PAT com permissao de listar runners da org (fallback). Vazio = ubuntu-latest."
+    required: false
+    default: ""
+outputs:
+  labels:
+    description: "JSON para usar em runs-on via fromJSON (array self-hosted ou string ubuntu-latest)"
+    value: ${{ steps.pick.outputs.labels }}
+runs:
+  using: composite
+  steps:
+    - id: pick
+      shell: bash
+      env:
+        GH_PAT: ${{ inputs.token }}
+        LABEL: ${{ inputs.label }}
+        ORG: ${{ inputs.org }}
+      run: |
+        if [ -z "$LABEL" ] || [ -z "$GH_PAT" ]; then
+          echo 'labels="ubuntu-latest"' >> "$GITHUB_OUTPUT"
+          echo "sem label/PAT -> ubuntu-latest"; exit 0
+        fi
+        online=$(curl -s -H "Authorization: token $GH_PAT" \
+          "https://api.github.com/orgs/$ORG/actions/runners?per_page=100" \
+          | jq --arg l "$LABEL" '[.runners[] | select(.status=="online" and ([.labels[].name] | index($l)))] | length')
+        if [ "${online:-0}" -gt 0 ]; then
+          echo "labels=[\"self-hosted\",\"linux\",\"x64\",\"$LABEL\"]" >> "$GITHUB_OUTPUT"
+          echo "$online runner(s) '$LABEL' online -> self-hosted"
+        else
+          echo 'labels="ubuntu-latest"' >> "$GITHUB_OUTPUT"
+          echo "sem runner '$LABEL' online -> ubuntu-latest (creditos GitHub)"
+        fi

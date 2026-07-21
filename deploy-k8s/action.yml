@@ -1,0 +1,32 @@
+name: deploy-k8s
+description: kubectl apply manifests to DOKS or EKS. Shell orchestrated via Taskfile.
+inputs:
+  provider:      { description: "doks | eks", required: true }
+  cluster:       { description: cluster name, required: true }
+  manifest-dir:  { description: "dir applied with -R -f, ou caminho de um manifest unico", required: true }
+  namespace-file: { description: optional namespace manifest applied first, required: false, default: "" }
+  rollout-restart: { description: "workload reiniciado apos o apply (ex.: deployment/foo). Vazio = nao reinicia", required: false, default: "" }
+  namespace:     { description: "namespace do rollout restart", required: false, default: default }
+  aws-region:    { description: EKS region, required: false, default: us-east-1 }
+runs:
+  using: composite
+  steps:
+    - name: Install task + kubectl
+      shell: bash
+      run: |
+        sh -c "$(curl -sSL https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+        if ! command -v kubectl >/dev/null; then
+          curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+        fi
+    - name: Apply (Taskfile)
+      shell: bash
+      env:
+        PROVIDER: ${{ inputs.provider }}
+        CLUSTER: ${{ inputs.cluster }}
+        MANIFEST_DIR: ${{ inputs.manifest-dir }}
+        NAMESPACE_FILE: ${{ inputs.namespace-file }}
+        ROLLOUT_RESTART: ${{ inputs.rollout-restart }}
+        NAMESPACE: ${{ inputs.namespace }}
+        AWS_REGION: ${{ inputs.aws-region }}
+      run: task --dir "$GITHUB_WORKSPACE" -t "${{ github.action_path }}/Taskfile.yml" apply

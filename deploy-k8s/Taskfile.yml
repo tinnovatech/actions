@@ -1,0 +1,59 @@
+version: '3'
+# Inputs via env: PROVIDER (doks|eks), CLUSTER, MANIFEST_DIR, NAMESPACE_FILE,
+#                 ROLLOUT_RESTART, NAMESPACE, AWS_REGION.
+# Auth (doctl / aws-oidc) is done by the workflow BEFORE this runs.
+#
+# MANIFEST_DIR aceita diretorio OU arquivo unico — as pipelines BB do Orkestral
+# aplicavam um manifest por env (k8s/deployment-qas.yaml), nao a pasta inteira.
+# Aplicar a pasta misturaria dev/qas/prod no mesmo cluster.
+tasks:
+  apply:
+    desc: Configure kubeconfig for the cluster and kubectl apply the manifests
+    cmds:
+      - task: kubeconfig
+      - task: apply-namespace
+      - task: apply-manifests
+      - task: rollout-restart
+      - task: rollout-status
+      - kubectl get all -n "${NAMESPACE:-default}" 2>/dev/null || true
+
+  kubeconfig:
+    internal: true
+    cmds:
+      - |
+        if [ "$PROVIDER" = "doks" ]; then
+          doctl kubernetes cluster kubeconfig save "$CLUSTER"
+        else
+          aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"
+        fi
+      # Diagnostico apenas — nao pode derrubar o deploy. Credencial com escopo de
+      # namespace (AmazonEKSEditPolicy em 1 ns) nao enxerga kube-system nem nodes,
+      # e antes disso o job morria aqui antes de sequer tentar o apply.
+      - kubectl cluster-info 2>/dev/null || echo "cluster-info indisponivel (permissao de namespace) — seguindo"
+      - kubectl get nodes 2>/dev/null || echo "get nodes indisponivel (permissao de namespace) — seguindo"
+
+  apply-namespace:
+    internal: true
+    status:
+      - test -z "$NAMESPACE_FILE"
+    cmd: kubectl apply -f "$NAMESPACE_FILE"
+
+  apply-manifests:
+    internal: true
+    cmd: kubectl apply -R -f "$MANIFEST_DIR"
+
+  # Tag mutavel (:qas, :develop) nao muda o spec do Deployment — sem restart o
+  # kubelet nunca repuxa a imagem nova. Espelha o 2o pipe aws-eks-kubectl-run do BB.
+  rollout-restart:
+    internal: true
+    status:
+      - test -z "$ROLLOUT_RESTART"
+    cmd: kubectl rollout restart "$ROLLOUT_RESTART" -n "${NAMESPACE:-default}"
+
+  # Falha o job se os pods novos nao subirem — no BB o deploy era fire-and-forget
+  # e um CrashLoop passava como pipeline verde.
+  rollout-status:
+    internal: true
+    status:
+      - test -z "$ROLLOUT_RESTART"
+    cmd: kubectl rollout status "$ROLLOUT_RESTART" -n "${NAMESPACE:-default}" --timeout=5m

@@ -1,0 +1,48 @@
+name: serverless-deploy
+# Reusable: build + serverless framework deploy per stage, AWS OIDC.
+# Mirrors BB *-serverless / sls-* pipelines.
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "18"
+      stage:
+        type: string
+        default: dev
+      service-path:
+        type: string
+        default: "."
+      aws-region:
+        type: string
+        default: us-east-1
+      environment:
+        type: string
+        default: ""
+    secrets:
+      AWS_OIDC_ROLE_ARN: { required: false }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.stage }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment != '' && inputs.environment || (github.ref_name == 'main' && 'prd' || (github.ref_name == 'stage' && 'qas' || 'dev')) }}
+    permissions: { contents: read, id-token: write }
+    defaults:
+      run:
+        working-directory: ${{ inputs.service-path }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ inputs.node-version }}', cache: npm }
+      - run: npm ci || npm install
+      - uses: tinnovatech/actions/aws-oidc-login@v1
+        with: { role-arn: '${{ secrets.AWS_OIDC_ROLE_ARN }}', aws-region: '${{ inputs.aws-region }}' }
+      - name: Serverless deploy
+        run: npx serverless deploy --stage ${{ inputs.stage }} --region ${{ inputs.aws-region }}

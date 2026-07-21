@@ -1,0 +1,21 @@
+name: run-terraform
+description: Run terragrunt validate/plan/apply over a dir. Shell orchestrated via Taskfile.
+inputs:
+  working-dir: { description: dir with terragrunt units, required: true }
+  action:      { description: "plan | apply", required: false, default: plan }
+  tg-version:  { description: terragrunt version, required: false, default: "0.67.0" }
+runs:
+  using: composite
+  steps:
+    - name: Install task + terragrunt
+      shell: bash
+      run: |
+        sh -c "$(curl -sSL https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+        curl -sL "https://github.com/gruntwork-io/terragrunt/releases/download/v${{ inputs.tg-version }}/terragrunt_linux_amd64" -o /usr/local/bin/terragrunt
+        chmod +x /usr/local/bin/terragrunt
+    - name: Terragrunt (Taskfile)
+      shell: bash
+      env:
+        WORKDIR: ${{ inputs.working-dir }}
+        TG_ACTION: ${{ inputs.action }}
+      run: task --dir "$GITHUB_WORKSPACE" -t "${{ github.action_path }}/Taskfile.yml" run
