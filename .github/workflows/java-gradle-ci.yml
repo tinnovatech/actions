@@ -24,6 +24,15 @@ on:
         description: "full image repo path (without tag)"
         type: string
         default: ""
+      platforms:
+        description: >-
+          Arquiteturas da imagem. O padrao segue linux/amd64 para nao mudar o
+          comportamento de quem ja usa este workflow. Use
+          "linux/amd64,linux/arm64" quando o destino for Graviton.
+          Atencao: a construcao para arm64 num runner amd64 passa por emulacao
+          QEMU e fica varias vezes mais lenta.
+        type: string
+        default: "linux/amd64"
       dockerfile:
         description: "path to Dockerfile"
         type: string
@@ -116,6 +125,11 @@ jobs:
         uses: tinnovatech/actions/do-registry-login@v1
         with:
           do-token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      # QEMU habilita a construcao para arquitetura diferente da do runner. Sem
+      # ele, `platforms` com arm64 falha: o runner e amd64 e nao sabe executar
+      # binario ARM durante o build.
+      - if: ${{ inputs.platforms != 'linux/amd64' }}
+        uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Build & push
         uses: docker/build-push-action@v6
@@ -123,6 +137,7 @@ jobs:
           context: .
           file: ${{ inputs.dockerfile }}
           push: true
+          platforms: ${{ inputs.platforms }}
           tags: ${{ inputs.image-name }}:${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

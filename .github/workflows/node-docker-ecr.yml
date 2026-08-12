@@ -7,6 +7,15 @@ on:
       package-manager: { type: string, default: "npm" }   # npm | bun
       node-version:    { type: string, default: "22" }
       build-cmd:       { type: string, default: "npm run build" }
+      platforms:
+        description: >-
+          Arquiteturas da imagem. O padrao segue linux/amd64 para nao mudar o
+          comportamento de quem ja usa este workflow. Use
+          "linux/amd64,linux/arm64" quando o destino for Graviton.
+          Atencao: a construcao para arm64 num runner amd64 passa por emulacao
+          QEMU e fica varias vezes mais lenta.
+        type: string
+        default: "linux/amd64"
       dockerfile:      { type: string, default: "Dockerfile" }
       image-name:      { type: string, required: true }     # ECR repo path (no tag)
       aws-region:      { type: string, default: "us-east-2" }
@@ -65,6 +74,11 @@ jobs:
         with: { role-arn: '${{ secrets.AWS_OIDC_ROLE_ARN }}', aws-region: '${{ inputs.aws-region }}' }
       - if: ${{ inputs.push }}
         uses: aws-actions/amazon-ecr-login@v2
+      # QEMU habilita a construcao para arquitetura diferente da do runner. Sem
+      # ele, `platforms` com arm64 falha: o runner e amd64 e nao sabe executar
+      # binario ARM durante o build.
+      - if: ${{ inputs.push && inputs.platforms != 'linux/amd64' }}
+        uses: docker/setup-qemu-action@v3
       - if: ${{ inputs.push }}
         uses: docker/setup-buildx-action@v3
       - if: ${{ inputs.push }}
@@ -73,6 +87,7 @@ jobs:
           context: .
           file: ${{ inputs.dockerfile }}
           push: true
+          platforms: ${{ inputs.platforms }}
           tags: ${{ inputs.image-name }}:${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
