@@ -1,0 +1,104 @@
+name: orkestral-k8s-promote
+# Vira o trafego de producao para a cor inativa — ou devolve para a anterior.
+#
+# Existe SEPARADO do deploy de proposito. Publicar a versao nova e virar o
+# trafego para ela sao duas decisoes: a primeira e do time, a segunda e uma
+# aprovacao. Juntas no mesmo job, o `environment` protegeria as duas ou nenhuma,
+# e o blue-green perderia o unico ponto em que alguem olha antes de os clientes
+# verem.
+#
+# `promote` e `rollback` sao a MESMA operacao — trocar o seletor entre as duas
+# cores. Nao ha caminho especial de volta que possa estar quebrado quando for
+# preciso.
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+      environment:
+        type: string
+        required: false
+        default: prd
+      vnet-id:
+        type: string
+        required: false
+        default: "1c9cbb2b-4bfe-44d0-ab67-34efa38b12f7"
+      cloudflare-organization:
+        type: string
+        required: false
+        default: tinnova
+    secrets:
+      CLOUDFLARE_AUTH_CLIENT_ID: { required: true }
+      CLOUDFLARE_AUTH_CLIENT_SECRET: { required: true }
+      ORKESTRAL_KUBECONFIG: { required: true }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orkestral-promote-${{ inputs.service }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    # É AQUI que a aprovação acontece: o ambiente `prd` tem revisor obrigatório,
+    # então o job fica parado esperando alguém aprovar antes de tocar no seletor.
+    environment: ${{ inputs.environment }}
+    env:
+      SERVICE: ${{ inputs.service }}
+      NAMESPACE: ${{ inputs.service }}-${{ inputs.environment }}
+    steps:
+      - name: Instalar kubectl
+        run: |
+          set -euo pipefail
+          curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+      - name: Conectar na rede privada
+        uses: tinnovatech/actions/warp-connect@v2
+        with:
+          client-id: ${{ secrets.CLOUDFLARE_AUTH_CLIENT_ID }}
+          client-secret: ${{ secrets.CLOUDFLARE_AUTH_CLIENT_SECRET }}
+          organization: ${{ inputs.cloudflare-organization }}
+          vnet-id: ${{ inputs.vnet-id }}
+          probe-host: k8s-prd.orkestralpay.com.br
+          probe-port: "6443"
+
+      - name: Escrever o kubeconfig
+        env:
+          KUBECONFIG_DATA: ${{ secrets.ORKESTRAL_KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Virar o trafego
+        run: |
+          set -euo pipefail
+          ACTIVE=$(kubectl -n "$NAMESPACE" get svc "$SERVICE" -o jsonpath='{.spec.selector.color}')
+          [ -n "$ACTIVE" ] || { echo "::error::${SERVICE} nao esta em blue-green"; exit 1; }
+          [ "$ACTIVE" = "blue" ] && INACTIVE=green || INACTIVE=blue
+
+          # Canario da promocao: virar trafego para uma cor que nao esta pronta e
+          # o jeito mais rapido de transformar blue-green em incidente. Sem esta
+          # recusa, o workflow e so um `kubectl patch` com nome bonito.
+          READY=$(kubectl -n "$NAMESPACE" get deploy "${SERVICE}-${INACTIVE}" \
+            -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+          if [ "${READY:-0}" -lt 1 ]; then
+            echo "::error::a cor ${INACTIVE} tem ${READY:-0} replica pronta — RECUSADO"
+            exit 1
+          fi
+
+          kubectl -n "$NAMESPACE" patch svc "$SERVICE" \
+            -p "{\"spec\":{\"selector\":{\"app\":\"${SERVICE}\",\"color\":\"${INACTIVE}\"}}}"
+          kubectl -n "$NAMESPACE" patch svc "${SERVICE}-preview" \
+            -p "{\"spec\":{\"selector\":{\"app\":\"${SERVICE}\",\"color\":\"${ACTIVE}\"}}}" || true
+
+          echo "::notice::trafego ${ACTIVE} -> ${INACTIVE}. A cor ${ACTIVE} continua de pe; rodar este mesmo workflow desfaz."
+
+      - name: Derrubar a VPN
+        if: always()
+        run: warp-cli --accept-tos disconnect || true

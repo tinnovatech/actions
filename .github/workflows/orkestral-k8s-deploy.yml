@@ -1,0 +1,165 @@
+name: orkestral-k8s-deploy
+# Implanta um servico da Orkestral no cluster Talos de producao (us-east-1).
+#
+# O cluster vive em subnet privada, sem endereco publico e sem API de nuvem que
+# entregue credencial — entao o runner precisa de DUAS coisas, e uma sem a outra
+# nao serve:
+#
+#   CLOUDFLARE_AUTH_CLIENT_ID/_SECRET  -> o runner ENTRA na rede privada (WARP)
+#   ORKESTRAL_KUBECONFIG               -> o runner FALA com o servidor de API
+#
+# Estrategia por ambiente, conforme decisao do dono:
+#   dev, qas -> rolling update (maxUnavailable 0 / maxSurge 1, ja gravado nos
+#               deployments por `orkestral-infra/scripts/harden-rolling.sh`)
+#   prd      -> blue-green: este workflow cria a cor INATIVA e PARA. Virar o
+#               trafego e um job separado, com aprovacao.
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "nome do servico (ex.: payment-service) — tambem e o nome do Deployment e do container"
+        type: string
+        required: true
+      environment:
+        description: "dev | qas | prd"
+        type: string
+        required: true
+      image:
+        description: "imagem completa, com digest ou tag"
+        type: string
+        required: true
+      strategy:
+        description: "rolling | bluegreen — vazio deduz do ambiente"
+        type: string
+        required: false
+        default: ""
+      vnet-id:
+        description: "rede virtual do WARP que anuncia 10.1.0.0/16"
+        type: string
+        required: false
+        default: "1c9cbb2b-4bfe-44d0-ab67-34efa38b12f7"
+      cloudflare-organization:
+        type: string
+        required: false
+        default: tinnova
+    secrets:
+      CLOUDFLARE_AUTH_CLIENT_ID: { required: true }
+      CLOUDFLARE_AUTH_CLIENT_SECRET: { required: true }
+      ORKESTRAL_KUBECONFIG: { required: true }
+
+permissions:
+  contents: read
+
+concurrency:
+  # Nunca dois deploys do MESMO servico no MESMO ambiente ao mesmo tempo. E
+  # `cancel-in-progress: false` de proposito: cancelar no meio de um rollout
+  # deixa o Deployment com duas versoes servindo, que e pior que esperar.
+  group: orkestral-deploy-${{ inputs.service }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      SERVICE: ${{ inputs.service }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      IMAGE: ${{ inputs.image }}
+      NAMESPACE: ${{ inputs.service }}-${{ inputs.environment }}
+    steps:
+      - name: Instalar kubectl
+        run: |
+          set -euo pipefail
+          curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+      - name: Conectar na rede privada
+        uses: tinnovatech/actions/warp-connect@v2
+        with:
+          client-id: ${{ secrets.CLOUDFLARE_AUTH_CLIENT_ID }}
+          client-secret: ${{ secrets.CLOUDFLARE_AUTH_CLIENT_SECRET }}
+          organization: ${{ inputs.cloudflare-organization }}
+          vnet-id: ${{ inputs.vnet-id }}
+          probe-host: k8s-prd.orkestralpay.com.br
+          probe-port: "6443"
+
+      - name: Escrever o kubeconfig
+        env:
+          KUBECONFIG_DATA: ${{ secrets.ORKESTRAL_KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Implantar
+        run: |
+          set -euo pipefail
+          STRATEGY="${{ inputs.strategy }}"
+          if [ -z "$STRATEGY" ]; then
+            [ "$ENVIRONMENT" = "prd" ] && STRATEGY=bluegreen || STRATEGY=rolling
+          fi
+          echo "servico=$SERVICE ambiente=$ENVIRONMENT estrategia=$STRATEGY"
+
+          if [ "$STRATEGY" = "rolling" ]; then
+            kubectl -n "$NAMESPACE" set image "deploy/${SERVICE}" "${SERVICE}=${IMAGE}"
+            kubectl -n "$NAMESPACE" rollout status "deploy/${SERVICE}" --timeout=600s
+            exit 0
+          fi
+
+          # ── blue-green ────────────────────────────────────────────────────
+          ACTIVE=$(kubectl -n "$NAMESPACE" get svc "$SERVICE" -o jsonpath='{.spec.selector.color}')
+          if [ -z "$ACTIVE" ]; then
+            echo "::error::${SERVICE} ainda nao esta em blue-green (Service sem seletor de cor). Rodar 'task bg:migrate -- ${SERVICE}' em orkestral-infra."
+            exit 1
+          fi
+          # `export`, e nao so atribuicao: o python3 abaixo le esta variavel de
+          # `os.environ`, e variavel de shell nao exportada nao atravessa para o
+          # processo filho — o filho leria vazio e criaria `<servico>-`.
+          [ "$ACTIVE" = "blue" ] && export INACTIVE=green || export INACTIVE=blue
+          echo "cor ativa=${ACTIVE} · publicando em ${INACTIVE}"
+
+          CURRENT_IMAGE=$(kubectl -n "$NAMESPACE" get deploy "${SERVICE}-${ACTIVE}" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          if [ "$CURRENT_IMAGE" = "$IMAGE" ]; then
+            echo "::error::a imagem e a MESMA que ja esta no ar — a troca nao provaria nada"
+            exit 1
+          fi
+
+          # A cor nova e COPIA da que esta no ar, com a imagem trocada: recursos,
+          # sondas, variaveis e arquitetura vem de quem esta servindo, e nao de um
+          # molde escrito a parte que envelhece em silencio.
+          # O programa vai para arquivo, e nao inline com `python3 -c "..."`.
+          # Dentro de um escalar `run: |`, TODA linha precisa manter a indentacao
+          # do bloco; um programa colado na coluna 0 encerra o escalar e o YAML
+          # deixa de fazer parse — sem que nada no shell acuse.
+          cat > "$RUNNER_TEMP/clone-color.py" <<'PY'
+          import sys, json, os
+          d = json.load(sys.stdin)
+          service = os.environ['SERVICE']
+          inactive = os.environ['INACTIVE']
+          image = os.environ['IMAGE']
+          d['metadata']['name'] = '{}-{}'.format(service, inactive)
+          for key in ('resourceVersion', 'uid', 'creationTimestamp',
+                      'generation', 'managedFields', 'annotations'):
+              d['metadata'].pop(key, None)
+          d['spec']['selector']['matchLabels']['color'] = inactive
+          d['spec']['template']['metadata']['labels']['color'] = inactive
+          d['spec']['template']['spec']['containers'][0]['image'] = image
+          d.pop('status', None)
+          json.dump(d, sys.stdout)
+          PY
+          # O heredoc herda a indentacao do YAML, que o Python recusaria. `<<-`
+          # so tira TAB, e aqui sao espacos — entao se remove com sed.
+          sed -i 's/^          //' "$RUNNER_TEMP/clone-color.py"
+
+          kubectl -n "$NAMESPACE" get deploy "${SERVICE}-${ACTIVE}" -o json \
+            | python3 "$RUNNER_TEMP/clone-color.py" \
+            | kubectl apply -f -
+          kubectl -n "$NAMESPACE" rollout status "deploy/${SERVICE}-${INACTIVE}" --timeout=600s
+
+          echo "::notice::${SERVICE}-${INACTIVE} pronto e NAO recebendo trafego. Exercitar por ${SERVICE}-preview e entao aprovar a promocao."
+
+      - name: Derrubar a VPN
+        if: always()
+        run: warp-cli --accept-tos disconnect || true

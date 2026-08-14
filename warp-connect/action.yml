@@ -1,0 +1,128 @@
+name: warp-connect
+description: >-
+  Conecta o runner na rede privada do cliente por Cloudflare WARP, usando
+  identidade de servico (service token), e PROVA que a faixa privada responde
+  antes de devolver o controle.
+inputs:
+  client-id:
+    description: "CF-Access-Client-Id do service token"
+    required: true
+  client-secret:
+    description: "CF-Access-Client-Secret do service token"
+    required: true
+  organization:
+    description: "nome da organizacao Zero Trust (o <org> de <org>.cloudflareaccess.com)"
+    required: true
+  vnet-id:
+    description: >-
+      Rede virtual que anuncia a faixa privada. OBRIGATORIA quando a conta tem
+      mais de uma — ver a nota no passo de conexao.
+    required: false
+    default: ""
+  probe-host:
+    description: "host da faixa privada usado para provar que ha rota"
+    required: true
+  probe-port:
+    description: porta do probe
+    required: false
+    default: "443"
+  probe-timeout-seconds:
+    description: "quanto esperar, no total, pela rota"
+    required: false
+    default: "100"
+
+runs:
+  using: composite
+  steps:
+    - name: Instalar o cliente WARP
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v warp-cli >/dev/null 2>&1; then echo "ja instalado"; exit 0; fi
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+          | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        # A distribuicao do runner muda sozinha quando o GitHub sobe a imagem de
+        # `ubuntu-latest`. Se o repositorio da Cloudflare ainda nao publicou o
+        # codinome novo, `apt-get update` falha e o job morre na instalacao —
+        # entao cai para `jammy`, que existe desde sempre.
+        CODENAME="$(lsb_release -cs)"
+        add_repo() {
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $1 main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+        }
+        add_repo "$CODENAME"
+        if ! sudo apt-get update -qq 2>/dev/null; then
+          echo "::warning::repositorio da Cloudflare sem ${CODENAME}; caindo para jammy"
+          add_repo jammy
+          sudo apt-get update -qq
+        fi
+        sudo apt-get install -y -qq cloudflare-warp
+
+    - name: Inscrever e conectar
+      shell: bash
+      env:
+        CLIENT_ID: ${{ inputs.client-id }}
+        CLIENT_SECRET: ${{ inputs.client-secret }}
+        ORGANIZATION: ${{ inputs.organization }}
+        VNET_ID: ${{ inputs.vnet-id }}
+      run: |
+        set -euo pipefail
+        # A inscricao vai por arquivo de politica com 600, nao por argumento de
+        # comando: em `warp-cli ... --secret $X` o segredo fica legivel para
+        # qualquer processo do runner num `ps`.
+        sudo mkdir -p /var/lib/cloudflare-warp
+        sudo install -m 600 /dev/null /var/lib/cloudflare-warp/mdm.xml
+        sudo tee /var/lib/cloudflare-warp/mdm.xml >/dev/null <<XML
+        <?xml version="1.0" encoding="UTF-8"?>
+        <dict>
+          <key>organization</key><string>${ORGANIZATION}</string>
+          <key>auth_client_id</key><string>${CLIENT_ID}</string>
+          <key>auth_client_secret</key><string>${CLIENT_SECRET}</string>
+          <key>service_mode</key><string>warp</string>
+          <key>auto_connect</key><string>1</string>
+        </dict>
+        XML
+        sudo systemctl restart warp-svc
+        for _ in $(seq 1 15); do warp-cli --accept-tos status >/dev/null 2>&1 && break; sleep 2; done
+        warp-cli --accept-tos connect || true
+
+        # ⚠️ Selecionar a rede virtual EXPLICITAMENTE quando a conta tem mais de
+        # uma. O cliente pode conectar na rede de OUTRO cliente e reportar
+        # `Connected` + `Network: healthy`, com a rota ate presente em
+        # `netstat -rn` — e nada na faixa privada responde. Medido em 14/08/2026:
+        # depois de uma alteracao no Zero Trust, o cliente reconectou sozinho
+        # ("Reason: Settings Changed") numa vnet diferente da que se estava
+        # usando. Tudo o que se costuma conferir dava certo.
+        if [ -n "${VNET_ID}" ]; then
+          for _ in $(seq 1 10); do
+            warp-cli --accept-tos vnet "${VNET_ID}" >/dev/null 2>&1 && break
+            sleep 3
+          done
+        fi
+        warp-cli --accept-tos status || true
+        warp-cli --accept-tos vnet   || true
+
+    - name: Provar que ha rota para a faixa privada
+      shell: bash
+      env:
+        PROBE_HOST: ${{ inputs.probe-host }}
+        PROBE_PORT: ${{ inputs.probe-port }}
+        PROBE_TIMEOUT: ${{ inputs.probe-timeout-seconds }}
+      run: |
+        set -euo pipefail
+        # Sem esta prova, um WARP mudo vira "o kubectl travou" tres passos
+        # adiante, e a investigacao comeca pelo cluster — que esta certo.
+        DEADLINE=$(( SECONDS + PROBE_TIMEOUT ))
+        ATTEMPT=0
+        while [ "$SECONDS" -lt "$DEADLINE" ]; do
+          ATTEMPT=$(( ATTEMPT + 1 ))
+          if timeout 5 bash -c "cat < /dev/null > /dev/tcp/${PROBE_HOST}/${PROBE_PORT}" 2>/dev/null; then
+            echo "rede privada responde em ${PROBE_HOST}:${PROBE_PORT} (tentativa ${ATTEMPT})"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "::error::sem rota para ${PROBE_HOST}:${PROBE_PORT} pelo WARP apos ${PROBE_TIMEOUT}s"
+        warp-cli --accept-tos status || true
+        warp-cli --accept-tos vnet   || true
+        exit 1
