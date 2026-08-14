@@ -16,7 +16,7 @@ on:
         default: "environments"
       aws-region:
         type: string
-        default: us-east-2
+        default: us-east-1
       apply:
         description: "roda apply nos modules planejados (exige aprovacao do environment)"
         type: boolean

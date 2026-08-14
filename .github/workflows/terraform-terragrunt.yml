@@ -15,7 +15,7 @@ on:
         default: "env"
       aws-region:
         type: string
-        default: us-east-2
+        default: us-east-1
       apply:
         description: run terragrunt apply (only after environment approval)
         type: boolean

@@ -18,7 +18,7 @@ on:
         default: "linux/amd64"
       dockerfile:      { type: string, default: "Dockerfile" }
       image-name:      { type: string, required: true }     # ECR repo path (no tag)
-      aws-region:      { type: string, default: "us-east-2" }
+      aws-region:      { type: string, default: "us-east-1" }
       push:            { type: boolean, default: false }
     secrets:
       AWS_OIDC_ROLE_ARN: { required: false }

@@ -21,11 +21,27 @@ tasks:
     internal: true
     cmds:
       - |
-        if [ "$PROVIDER" = "doks" ]; then
-          doctl kubernetes cluster kubeconfig save "$CLUSTER"
-        else
-          aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"
-        fi
+        case "$PROVIDER" in
+          doks)
+            doctl kubernetes cluster kubeconfig save "$CLUSTER"
+            ;;
+          kubeconfig)
+            # Cluster autogerido, sem API da nuvem que entregue credencial —
+            # Talos é o caso. O kubeconfig vem inteiro num segredo.
+            #
+            # ⚠️ Escrito com 600 ANTES de qualquer conteúdo entrar. Criar o
+            # arquivo e ajustar a permissão depois deixa uma janela em que ele
+            # está legível por qualquer processo do runner.
+            [ -n "$KUBECONFIG_DATA" ] || { echo "🛑 KUBECONFIG_DATA vazio"; exit 1; }
+            umask 077
+            printf '%s' "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"
+            export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+            echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+            ;;
+          *)
+            aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"
+            ;;
+        esac
       # Diagnostico apenas — nao pode derrubar o deploy. Credencial com escopo de
       # namespace (AmazonEKSEditPolicy em 1 ns) nao enxerga kube-system nem nodes,
       # e antes disso o job morria aqui antes de sequer tentar o apply.
