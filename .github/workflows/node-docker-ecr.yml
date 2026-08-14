@@ -20,8 +20,29 @@ on:
       image-name:      { type: string, required: true }     # ECR repo path (no tag)
       aws-region:      { type: string, default: "us-east-1" }
       push:            { type: boolean, default: false }
+      registry:
+        description: "ecr | harbor"
+        type: string
+        default: "ecr"
+      harbor-host:
+        description: >-
+          Host do Harbor quando registry=harbor. O Harbor da Orkestral vive
+          DENTRO da rede privada (10.1.8.252, atras do Kong interno) — sem WARP
+          o push falha por tempo esgotado.
+        type: string
+        default: ""
+      warp-organization:
+        type: string
+        default: ""
+      warp-vnet-id:
+        type: string
+        default: ""
     secrets:
       AWS_OIDC_ROLE_ARN: { required: false }
+      HARBOR_USERNAME: { required: false }
+      HARBOR_PASSWORD: { required: false }
+      CLOUDFLARE_AUTH_CLIENT_ID: { required: false }
+      CLOUDFLARE_AUTH_CLIENT_SECRET: { required: false }
       # Variaveis exigidas em BUILD time (Next valida env no build e aborta se faltar).
       # Formato dotenv, uma por linha: NOME=valor. Equivalem as deployment variables
       # do Bitbucket, que nao vieram na migracao — sem isso o build quebra com
@@ -69,11 +90,30 @@ jobs:
       - name: Build
         run: ${{ inputs.build-cmd }}
       # docker build + push (only when push=true)
-      - if: ${{ inputs.push }}
+      - if: ${{ inputs.push && inputs.registry == 'ecr' }}
         uses: tinnovatech/actions/aws-oidc-login@v1
         with: { role-arn: '${{ secrets.AWS_OIDC_ROLE_ARN }}', aws-region: '${{ inputs.aws-region }}' }
-      - if: ${{ inputs.push }}
+      - if: ${{ inputs.push && inputs.registry == 'ecr' }}
         uses: aws-actions/amazon-ecr-login@v2
+      # O Harbor da Orkestral nao encara a internet: o push so acontece de dentro
+      # da rede privada, e o probe da acao prova a rota antes de tentar.
+      - name: WARP (Harbor esta na rede privada)
+        if: ${{ inputs.push && inputs.registry == 'harbor' }}
+        uses: tinnovatech/actions/warp-connect@v2
+        with:
+          client-id: ${{ secrets.CLOUDFLARE_AUTH_CLIENT_ID }}
+          client-secret: ${{ secrets.CLOUDFLARE_AUTH_CLIENT_SECRET }}
+          organization: ${{ inputs.warp-organization }}
+          vnet-id: ${{ inputs.warp-vnet-id }}
+          probe-host: ${{ inputs.harbor-host }}
+          probe-port: "443"
+      - name: Harbor login
+        if: ${{ inputs.push && inputs.registry == 'harbor' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.harbor-host }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
       # QEMU habilita a construcao para arquitetura diferente da do runner. Sem
       # ele, `platforms` com arm64 falha: o runner e amd64 e nao sabe executar
       # binario ARM durante o build.
@@ -88,6 +128,11 @@ jobs:
           file: ${{ inputs.dockerfile }}
           push: true
           platforms: ${{ inputs.platforms }}
-          tags: ${{ inputs.image-name }}:${{ github.ref_name }}
+          # A etiqueta por commit e a que o deploy consome: `:<branch>` e mutavel,
+          # e com ela a verificacao "a imagem nova e igual a que esta no ar?"
+          # compara dois nomes iguais e sempre diz que sim.
+          tags: |
+            ${{ inputs.image-name }}:${{ github.ref_name }}
+            ${{ inputs.image-name }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
