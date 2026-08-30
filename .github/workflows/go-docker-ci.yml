@@ -1,0 +1,209 @@
+name: go-docker-ci
+# Reutilizável: testa um serviço em Go e publica a imagem no registro.
+#
+# Irmão do `java-gradle-ci.yml`, para os serviços em Go da Orkestral
+# (`recover-token-service`, `store-token-service`). A esteira do chamado GLPI 187
+# só tinha caminho para Gradle — os repositórios em Go continuavam publicando no
+# ECR de us-east-2, que foi desligado no chamado 184.
+#
+# ── O que este workflow NÃO faz ──────────────────────────────────────────────
+#
+# Não implanta. Publicar imagem e trocar o que está no ar são decisões
+# diferentes, e quem implanta é o `orkestral-k8s-deploy.yml`.
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: "versão do Go. Vazio usa a declarada em go.mod, que é a fonte certa"
+        type: string
+        default: ""
+      registry:
+        description: "harbor | ecr | none"
+        type: string
+        default: "harbor"
+      harbor-host:
+        description: >-
+          Host do Harbor quando registry=harbor. ATENÇÃO: o Harbor da Orkestral
+          vive DENTRO da rede privada (harbor.orkestralpay.com.br resolve para
+          10.1.8.252, atrás do Kong interno) — sem WARP conectado o push falha
+          por tempo esgotado, e por isso `warp-vnet-id` acompanha esta opção.
+        type: string
+        default: ""
+      warp-organization:
+        description: "organização Zero Trust, quando o registro exigir rede privada"
+        type: string
+        default: ""
+      warp-vnet-id:
+        description: "rede virtual que anuncia a faixa privada do registro"
+        type: string
+        default: ""
+      aws-region:
+        type: string
+        default: us-east-1
+      image-name:
+        description: "caminho completo da imagem, sem a etiqueta"
+        type: string
+        default: ""
+      platforms:
+        description: >-
+          Arquiteturas da imagem. Os nós de aplicação da Orkestral são Graviton:
+          publicar só amd64 faz o pod morrer com `exec format error`.
+          A construção arm64 num runner amd64 passa por emulação QEMU e é lenta.
+        type: string
+        default: "linux/amd64,linux/arm64"
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+      kustomize-overlays:
+        description: >-
+          Overlays a validar com `kubectl kustomize`, separados por espaço.
+          Vazio pula a validação — repositório sem manifesto não deve falhar aqui.
+        type: string
+        default: ""
+      push:
+        description: "constrói e publica a imagem"
+        type: boolean
+        default: false
+    secrets:
+      AWS_OIDC_ROLE_ARN:
+        required: false
+      HARBOR_USERNAME:
+        required: false
+      HARBOR_PASSWORD:
+        required: false
+      CLOUDFLARE_AUTH_CLIENT_ID:
+        required: false
+      CLOUDFLARE_AUTH_CLIENT_SECRET:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      # `go-version-file` lê o go.mod: a versão fica declarada num lugar só, e
+      # atualizar o módulo não deixa a esteira para trás. `go-version` só entra
+      # quando o chamador precisa forçar outra.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          go-version-file: ${{ inputs.go-version == '' && 'go.mod' || '' }}
+          cache: true
+
+      - name: Verificar módulos
+        run: go mod verify
+
+      - name: Vet
+        run: go vet ./...
+
+      # O detector de corrida só encontra o defeito se o caminho concorrente for
+      # exercitado — ele não analisa código parado. Vale o custo mesmo assim:
+      # corrida em serviço de token aparece como resposta trocada entre clientes.
+      - name: Testes com detector de corrida
+        run: go test -race ./...
+
+      - name: Compilar
+        run: CGO_ENABLED=0 go build -trimpath ./...
+
+      - uses: azure/setup-kubectl@v4
+        if: ${{ inputs.kustomize-overlays != '' }}
+
+      # Manifesto quebrado só apareceria na hora do deploy, com a imagem já
+      # publicada. Validar aqui custa segundos.
+      - name: Validar overlays de Kubernetes
+        if: ${{ inputs.kustomize-overlays != '' }}
+        env:
+          OVERLAYS: ${{ inputs.kustomize-overlays }}
+        run: |
+          set -euo pipefail
+          for overlay in $OVERLAYS; do
+            echo "▸ $overlay"
+            kubectl kustomize "$overlay" >/dev/null
+          done
+
+  docker:
+    if: ${{ inputs.push }}
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC do ECR
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: AWS OIDC (ECR)
+        if: ${{ inputs.registry == 'ecr' }}
+        uses: tinnovatech/actions/aws-oidc-login@v1
+        with:
+          role-arn: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login no ECR
+        if: ${{ inputs.registry == 'ecr' }}
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # O Harbor da Orkestral não encara a internet: o push só acontece de dentro
+      # da rede privada. A sonda da ação prova a rota ANTES do build, senão a
+      # falha aparece só no fim, depois de gastar a construção inteira.
+      - name: WARP (o Harbor está na rede privada)
+        if: ${{ inputs.registry == 'harbor' }}
+        uses: tinnovatech/actions/warp-connect@v2
+        with:
+          client-id: ${{ secrets.CLOUDFLARE_AUTH_CLIENT_ID }}
+          client-secret: ${{ secrets.CLOUDFLARE_AUTH_CLIENT_SECRET }}
+          organization: ${{ inputs.warp-organization }}
+          vnet-id: ${{ inputs.warp-vnet-id }}
+          probe-host: ${{ inputs.harbor-host }}
+          probe-port: "443"
+
+      - name: Login no Harbor
+        if: ${{ inputs.registry == 'harbor' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.harbor-host }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      # QEMU habilita a construção para arquitetura diferente da do runner. Sem
+      # ele, `platforms` com arm64 falha: o runner é amd64 e não sabe executar
+      # binário ARM durante o build.
+      - if: ${{ inputs.platforms != 'linux/amd64' }}
+        uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Construir e publicar
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          platforms: ${{ inputs.platforms }}
+          # DUAS etiquetas, e a segunda é a que importa para o deploy.
+          #
+          # `:<branch>` é mutável — útil para quem quer "a última de develop",
+          # inútil para provar identidade de versão: duas construções seguidas
+          # produzem `:develop` e `:develop`, e a verificação "a imagem nova é
+          # igual à que está no ar?" passa a mentir.
+          #
+          # `:<sha>` é imutável e amarra a imagem ao commit. É o que o deploy
+          # consome.
+          tags: |
+            ${{ inputs.image-name }}:${{ github.ref_name }}
+            ${{ inputs.image-name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Derrubar a VPN
+        if: ${{ always() && inputs.registry == 'harbor' }}
+        run: warp-cli --accept-tos disconnect || true
