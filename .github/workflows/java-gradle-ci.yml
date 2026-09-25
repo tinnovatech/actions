@@ -53,6 +53,19 @@ on:
         description: "path to Dockerfile"
         type: string
         default: "Dockerfile"
+      working-directory:
+        description: >-
+          Diretorio do build dentro do repositorio, para monorepo. O padrao "."
+          mantem o comportamento de quem chama este workflow com o build na raiz,
+          entao nenhum chamador existente muda.
+
+          Quando preenchido (ex.: "services/management-service"), os comandos do
+          Gradle rodam ali, o cache do setup-gradle e ancorado ali, e o contexto do
+          docker build passa a ser esse diretorio — nao a raiz. ATENCAO: o Dockerfile
+          e resolvido como <working-directory>/<dockerfile>, e um COPY que suba de
+          nivel (../) sai do contexto e falha com "not found".
+        type: string
+        default: "."
       push:
         description: "build & push docker image"
         type: boolean
@@ -91,8 +104,13 @@ jobs:
           distribution: temurin
           java-version: ${{ inputs.java-version }}
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          # Sem isto a action procura o build na RAIZ: em monorepo ela nao acha
+          # wrapper e o cache é gravado com a chave errada.
+          build-root-directory: ${{ inputs.working-directory }}
       # use the repo's wrapper (pinned Gradle version) when present; fall back to system gradle
       - name: Build
+        working-directory: ${{ inputs.working-directory }}
         run: |
           if [ -x ./gradlew ] || [ -f ./gradlew ]; then chmod +x ./gradlew; ./gradlew ${{ inputs.gradle-args }}; else gradle ${{ inputs.gradle-args }}; fi
       # O test roda num invocation separado do build, entao flags globais passadas em
@@ -100,6 +118,7 @@ jobs:
       # do repo esta desatualizado) precisam ser repropagadas aqui — senao o build passa
       # e o test morre resolvendo as mesmas dependencias.
       - name: Test
+        working-directory: ${{ inputs.working-directory }}
         env:
           TESTCONTAINERS_RYUK_DISABLED: "true"
           GRADLE_ARGS: ${{ inputs.gradle-args }}
@@ -108,6 +127,13 @@ jobs:
           case "$GRADLE_ARGS" in
             *"--dependency-verification off"*) extra="--dependency-verification off" ;;
           esac
+          # shellcheck disable=SC2086
+          # $extra SEM aspas é deliberado, nos dois sentidos: vazio, ele tem de
+          # DESAPARECER (com aspas viraria um argumento vazio que o Gradle recusa);
+          # preenchido, tem de sofrer word splitting em DOIS argumentos
+          # (--dependency-verification e off). O actionlint aponta SC2086 aqui desde
+          # antes; "corrigir" com aspas quebra o caso que a condicional existe para
+          # atender.
           if [ -f ./gradlew ]; then ./gradlew test --no-daemon $extra; else gradle test --no-daemon $extra; fi
       - name: Sonar
         if: ${{ inputs.run-sonar }}
@@ -131,8 +157,13 @@ jobs:
           distribution: temurin
           java-version: ${{ inputs.java-version }}
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          # Sem isto a action procura o build na RAIZ: em monorepo ela nao acha
+          # wrapper e o cache é gravado com a chave errada.
+          build-root-directory: ${{ inputs.working-directory }}
       # Dockerfiles fazem COPY build/distributions/*.tar
       - name: Build (para o Dockerfile)
+        working-directory: ${{ inputs.working-directory }}
         run: |
           if [ -x ./gradlew ] || [ -f ./gradlew ]; then chmod +x ./gradlew; ./gradlew ${{ inputs.gradle-args }}; else gradle ${{ inputs.gradle-args }}; fi
       - name: AWS OIDC (ECR)
@@ -178,8 +209,13 @@ jobs:
       - name: Build & push
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ${{ inputs.dockerfile }}
+          # O contexto é o diretorio do build, nao a raiz: num monorepo, mandar a
+          # raiz inteira enviaria os outros servicos ao daemon e os `COPY` relativos
+          # do Dockerfile apontariam para o lugar errado.
+          context: ${{ inputs.working-directory }}
+          # Caminho a partir do workspace, por isso composto. Com o padrao "." isto
+          # resolve para "./Dockerfile", identico ao comportamento anterior.
+          file: ${{ inputs.working-directory }}/${{ inputs.dockerfile }}
           push: true
           platforms: ${{ inputs.platforms }}
           # DUAS etiquetas, e a segunda e a que importa para blue-green.
